@@ -68,7 +68,6 @@ _SUBSCRIPTION_RUNTIME_OVERRIDES = (
     "features.plugin_sharing=false",
     "features.plugins=false",
     "features.remote_plugin=false",
-    "features.shell_snapshot=false",
     "features.skill_mcp_dependency_install=false",
     "features.workspace_dependencies=false",
     "mcp_servers={}",
@@ -78,6 +77,22 @@ _SUBSCRIPTION_RUNTIME_OVERRIDES = (
     "skills.bundled=[]",
     "skills.include_instructions=false",
 )
+
+# Flags that must always be applied regardless of subscription state. Keep
+# minimal and safety-focused here so they cannot be opted out by subscription
+# specific overrides.
+_ALWAYS_ON_SAFETY_OVERRIDES = ("features.shell_snapshot=false",)
+
+# Handed to Codex in place of the provider key whenever a relay fronts the
+# upstream. The relay holds the real credential, and `requires_openai_auth=false`
+# means Codex never validates this value.
+#
+# This is load-bearing rather than defensive: Codex captures its own environment
+# into `shell_snapshots/*.sh`, and `features.shell_snapshot=false` above is
+# accepted but not honoured by openai-codex 0.147.0, so the capture cannot be
+# switched off from here. Keeping the secret out of the child environment is the
+# part we control.
+_RELAY_CHILD_KEY_PLACEHOLDER = "praxist-relay-local-no-upstream-credential"
 
 _SAFE_PROCESS_ENV_KEYS = frozenset(
     {
@@ -450,7 +465,7 @@ class CodexSdkRuntime:
             relay: RelayHandle | None = None
             staged_chatgpt_home: StagedChatgptHome | None = None
             provider_id = "openai"
-            config_overrides: tuple[str, ...] = ()
+            config_overrides: tuple[str, ...] = _ALWAYS_ON_SAFETY_OVERRIDES
             subscription = _uses_chatgpt_subscription(request, context.env)
             client: Any | None = None
             try:
@@ -490,6 +505,7 @@ class CodexSdkRuntime:
                     log_dir = state_dir / "logs"
                     log_dir.mkdir(parents=True, exist_ok=True)
                     config_overrides = (
+                        *_ALWAYS_ON_SAFETY_OVERRIDES,
                         f"sqlite_home={json.dumps(str(sqlite_home))}",
                         f"log_dir={json.dumps(str(log_dir))}",
                         "cli_auth_credentials_store="
@@ -511,6 +527,12 @@ class CodexSdkRuntime:
                         upstream_extra_params=relay_extra_params,
                         drop_upstream_params=relay_drop_params,
                     )
+                    # The relay owns the real credential for the upstream hop, so
+                    # the child does not need it. Codex authenticates against the
+                    # relay, which does not check this value, and an environment
+                    # capture then has no secret to serialise.
+                    client_env[key_var] = _RELAY_CHILD_KEY_PLACEHOLDER
+                    client_env["OPENAI_API_KEY"] = _RELAY_CHILD_KEY_PLACEHOLDER
                     provider_id = "praxist_relay"
                     config_overrides += (
                         'model_provider="praxist_relay"',
@@ -820,6 +842,7 @@ def available_chatgpt_models() -> tuple[str, ...]:
                         "cli_auth_credentials_store=" + json.dumps(staged.credential_store),
                         f"sqlite_home={json.dumps(state_dir)}",
                         f"log_dir={json.dumps(state_dir)}",
+                        *_ALWAYS_ON_SAFETY_OVERRIDES,
                         *_SUBSCRIPTION_RUNTIME_OVERRIDES,
                     ),
                     env=_client_process_env("openai", os.environ, staged.path, subscription=True),
